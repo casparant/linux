@@ -248,6 +248,10 @@ void bch_write_bdev_super(struct cached_dev *dc, struct closure *parent)
 	struct closure *cl = &dc->sb_write;
 	struct bio *bio = &dc->sb_bio;
 
+	/* skip backing device without sb */
+	if (!bio->bi_io_vec[0].bv_page)
+		return;
+
 	down(&dc->sb_write_mutex);
 	closure_init(cl, parent);
 
@@ -1290,8 +1294,8 @@ static void register_bdev(struct cache_sb *sb, struct page *sb_page,
 
 	bio_init(&dc->sb_bio, dc->sb_bio.bi_inline_vecs, 1);
 	bio_first_bvec_all(&dc->sb_bio)->bv_page = sb_page;
-	get_page(sb_page);
-
+	if (sb_page)
+		get_page(sb_page);
 
 	if (cached_dev_init(dc, sb->block_size << 9))
 		goto err;
@@ -2186,29 +2190,109 @@ static bool bch_is_open(struct block_device *bdev)
 	return bch_is_open_cache(bdev) || bch_is_open_backing(bdev);
 }
 
+#define BCACHE_SB_VERSION_BDEV_WITHOUT_SB BCACHE_SB_MAX_VERSION
+static inline bool sb_is_mock(const struct cache_sb *sb)
+{
+	return sb->version == BCACHE_SB_VERSION_BDEV_WITHOUT_SB;
+}
+
+
+static char *fill_bdev_super(struct cache_sb *sb, struct block_device *bdev,
+			     char *args)
+{
+	static const char zero_uuid[16] = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+	char *data_offset_arg, *uuid_arg, *set_uuid_arg = NULL;
+	__u64 data_offset = 0;
+
+	/* skip 'bdev' arg */
+	strsep(&args, " ");
+	BUG_ON(!args);
+
+	data_offset_arg = strsep(&args, " ");
+	if (!args)
+		return "Bad data offset";
+	if (sscanf(data_offset_arg, "%llu", &data_offset) != 1)
+		return "Bad data offset";
+	uuid_arg = strsep(&args, " ");
+	set_uuid_arg = strsep(&args, " ");
+
+	sb->offset = 0;
+	sb->version = BCACHE_SB_VERSION_BDEV_WITHOUT_SB;
+	memcpy(sb->magic, bcache_magic, 16);
+
+	if (bch_parse_uuid(uuid_arg, sb->uuid) < 16)
+		return "Bad UUID";
+
+	if (set_uuid_arg) {
+		if (bch_parse_uuid(set_uuid_arg, sb->set_uuid) < 16)
+			return "Bad set UUID";
+	} else {
+		memcpy(sb->set_uuid, zero_uuid, 16);
+	}
+
+	SET_CACHE_REPLACEMENT(sb, CACHE_REPLACEMENT_LRU);
+	sb->csum = csum_set(sb);
+
+	if (bch_is_zero(sb->uuid, 16))
+		return "Zero UUID";
+
+	sb->block_size = 1;
+	sb->data_offset = data_offset;
+	sb->last_mount = get_seconds();
+
+	return NULL;
+}
+
+/*
+ * args format:
+ * 	[bdev] [data_offset] [uuid] {set_uuid}
+ */
+static int parse_bdev_args(char *args, size_t size, char **path)
+{
+	char *bdev_end, *str = strim(args);
+	int ret = 0;
+
+	bdev_end = strchr(str, ' ');
+	if (bdev_end) {
+		size = bdev_end - str;
+		ret = 1;
+	}
+
+	if (!(*path = kstrndup(str, size, GFP_KERNEL)))
+		return -ENOMEM;
+
+	return ret;
+}
+
 static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 			       const char *buffer, size_t size)
 {
 	ssize_t ret = size;
 	const char *err = "cannot allocate memory";
-	char *path = NULL;
+	char *args = NULL, *path = NULL;
 	struct cache_sb *sb = NULL;
 	struct block_device *bdev = NULL;
 	struct page *sb_page = NULL;
+	int sb_mock = 0;
 
 	if (!try_module_get(THIS_MODULE))
 		return -EBUSY;
 
-	path = kstrndup(buffer, size, GFP_KERNEL);
-	if (!path)
+	args = kstrndup(buffer, size, GFP_KERNEL);
+	if (!args)
 		goto err;
 
 	sb = kmalloc(sizeof(struct cache_sb), GFP_KERNEL);
 	if (!sb)
 		goto err;
 
+	err = "parse_bdev_args failed";
+	sb_mock = parse_bdev_args(args, size, &path);
+	if (sb_mock < 0)
+		goto err;
+
 	err = "failed to open device";
-	bdev = blkdev_get_by_path(strim(path),
+	bdev = blkdev_get_by_path(path,
 				  FMODE_READ|FMODE_WRITE|FMODE_EXCL,
 				  sb);
 	if (IS_ERR(bdev)) {
@@ -2232,12 +2316,15 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 	if (set_blocksize(bdev, 4096))
 		goto err_close;
 
-	err = read_super(sb, bdev, &sb_page);
+	if (sb_mock)
+		err = fill_bdev_super(sb, bdev, strim(args));
+	else
+		err = read_super(sb, bdev, &sb_page);
 	if (err)
 		goto err_close;
 
 	err = "failed to register device";
-	if (SB_IS_BDEV(sb)) {
+	if (SB_IS_BDEV(sb) || sb_is_mock(sb)) {
 		struct cached_dev *dc = kzalloc(sizeof(*dc), GFP_KERNEL);
 
 		if (!dc)
@@ -2260,6 +2347,7 @@ out:
 		put_page(sb_page);
 	kfree(sb);
 	kfree(path);
+	kfree(args);
 	module_put(THIS_MODULE);
 	return ret;
 
